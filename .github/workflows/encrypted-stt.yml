@@ -1,0 +1,148 @@
+name: Encrypted temporary transcription
+
+on:
+  push:
+    branches:
+      - 'stt-job-*'
+    paths:
+      - 'stt_job/start.txt'
+
+permissions:
+  contents: write
+
+jobs:
+  transcribe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - name: Check out job branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate ephemeral input key and wait for encrypted audio
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRANCH="${GITHUB_REF_NAME}"
+          REPO="${GITHUB_REPOSITORY}"
+          mkdir -p /tmp/stt stt_job
+
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out /tmp/stt/input_private.pem >/dev/null 2>&1
+          openssl pkey -in /tmp/stt/input_private.pem -pubout -out stt_job/input_public.pem >/dev/null 2>&1
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add stt_job/input_public.pem
+          git commit -m "Publish ephemeral STT input key" || true
+          git push origin "HEAD:${BRANCH}"
+
+          found=0
+          for i in $(seq 1 240); do
+            ok=1
+            for name in audio.enc input_key.enc; do
+              url="https://api.github.com/repos/${REPO}/contents/stt_job/${name}?ref=${BRANCH}"
+              if ! curl -fsS \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "$url" -o "/tmp/stt/${name}.json"; then
+                ok=0
+                break
+              fi
+            done
+            if [ "$ok" -eq 1 ]; then
+              python3 - <<'PY'
+import base64, json, pathlib
+for name in ('audio.enc', 'input_key.enc'):
+    obj = json.loads(pathlib.Path(f'/tmp/stt/{name}.json').read_text())
+    pathlib.Path(f'/tmp/stt/{name}').write_bytes(base64.b64decode(obj['content']))
+PY
+              found=1
+              break
+            fi
+            sleep 10
+          done
+          if [ "$found" -ne 1 ]; then
+            echo "Encrypted payload was not received before timeout" >&2
+            exit 2
+          fi
+
+          openssl pkeyutl -decrypt \
+            -inkey /tmp/stt/input_private.pem \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -in /tmp/stt/input_key.enc \
+            -out /tmp/stt/input_keyinfo.bin
+
+          KEY_HEX="$(head -c 32 /tmp/stt/input_keyinfo.bin | xxd -p -c 256)"
+          IV_HEX="$(tail -c 16 /tmp/stt/input_keyinfo.bin | xxd -p -c 256)"
+          openssl enc -d -aes-256-cbc -K "$KEY_HEX" -iv "$IV_HEX" \
+            -in /tmp/stt/audio.enc -out /tmp/stt/meeting.mp3
+          test "$(wc -c < /tmp/stt/meeting.mp3)" -gt 100000
+
+      - name: Build Whisper and transcribe
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg cmake build-essential curl
+          ffmpeg -v error -y -i /tmp/stt/meeting.mp3 -ar 16000 -ac 1 -c:a pcm_s16le /tmp/stt/meeting.wav
+
+          git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git /tmp/stt/whisper.cpp
+          cmake -S /tmp/stt/whisper.cpp -B /tmp/stt/whisper.cpp/build \
+            -DGGML_NATIVE=OFF -DWHISPER_SDL2=OFF -DCMAKE_BUILD_TYPE=Release >/tmp/stt/cmake.log 2>&1
+          cmake --build /tmp/stt/whisper.cpp/build --target whisper-cli -j2 >>/tmp/stt/cmake.log 2>&1
+
+          curl -fL --retry 4 --retry-delay 3 \
+            -o /tmp/stt/model.bin \
+            https://github.com/w3xgroup/taskurio-models/releases/download/whisper-models-v1/ggml-base-q5_1.bin
+
+          CLI="/tmp/stt/whisper.cpp/build/bin/whisper-cli"
+          set +e
+          "$CLI" \
+            -m /tmp/stt/model.bin \
+            -f /tmp/stt/meeting.wav \
+            -l auto \
+            -otxt -osrt -of /tmp/stt/transcript \
+            --prompt "BEAT.GG, Jax, AK, investor, founder, equity, stock option pool, thirty percent, forty percent, dilution, shares" \
+            > /tmp/stt/whisper.log 2>&1
+          RC=$?
+          set -e
+          echo "$RC" > /tmp/stt/exit_code.txt
+          test -s /tmp/stt/transcript.txt || { tail -200 /tmp/stt/whisper.log >&2; exit "$RC"; }
+
+      - name: Encrypt result and publish ciphertext
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRANCH="${GITHUB_REF_NAME}"
+          tar -czf /tmp/stt/result.tar.gz -C /tmp/stt \
+            transcript.txt transcript.srt whisper.log exit_code.txt cmake.log
+
+          head -c 48 /dev/urandom > /tmp/stt/output_keyinfo.bin
+          KEY_HEX="$(head -c 32 /tmp/stt/output_keyinfo.bin | xxd -p -c 256)"
+          IV_HEX="$(tail -c 16 /tmp/stt/output_keyinfo.bin | xxd -p -c 256)"
+          openssl enc -aes-256-cbc -K "$KEY_HEX" -iv "$IV_HEX" \
+            -in /tmp/stt/result.tar.gz -out /tmp/stt/result.enc
+          openssl pkeyutl -encrypt \
+            -pubin -inkey stt_job/output_public.pem \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -in /tmp/stt/output_keyinfo.bin \
+            -out /tmp/stt/result_key.enc
+
+          git fetch origin "$BRANCH"
+          git reset --hard "origin/${BRANCH}"
+          mkdir -p stt_job
+          cp /tmp/stt/result.enc stt_job/result.enc
+          cp /tmp/stt/result_key.enc stt_job/result_key.enc
+          printf 'complete\n' > stt_job/status.txt
+          rm -f stt_job/audio.enc stt_job/input_key.enc stt_job/input_public.pem
+          git add -A stt_job
+          git commit -m "Publish encrypted STT result"
+          git push origin "HEAD:${BRANCH}"
